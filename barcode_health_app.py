@@ -1,23 +1,16 @@
-# streamlit_barcode_health_app.py
-# Streamlit app: "Scanner Saudável" - Escaneie código de barras e verifique qualidade nutricional
-#streamlit run barcode_health_app.py
-
 import streamlit as st
 import sqlite3
 import pandas as pd
 import io
-from PIL import Image
 import datetime
 import altair as alt
 import requests
 import os
+import av
 
-# --- Instalação de bibliotecas (opcional, Streamlit Cloud gerencia) ---
-try:
-    from pyzbar.pyzbar import decode
-    PYZBAR_AVAILABLE = True
-except Exception:
-    PYZBAR_AVAILABLE = False
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
+from pyzbar.pyzbar import decode
+import cv2
 
 # --- CONFIGURAÇÃO E DADOS ---
 # ALERTA: Substitua esta URL pela URL "Raw" do seu arquivo products.db no GitHub
@@ -27,7 +20,6 @@ DB_PATH = "products.db"
 NUTRI_PASSWORD = "nutri123"
 
 # Dados de exemplo para o caso de o banco de dados estar vazio
-# (Este bloco pode ser removido se o products.db estiver sempre preenchido)
 SAMPLE_CSV_DATA = """
 barcode,name,brand,category,sodium_mg_per_100g,sugar_g_per_100g,total_fat_g_per_100g,is_gmo
 7891234567890,Suco de Uva Integral,Vinhedo Bom,Bebidas,5,15,0.1,Não
@@ -42,14 +34,14 @@ def download_db_from_github():
     st.info("Baixando o banco de dados do GitHub...")
     try:
         response = requests.get(GITHUB_DB_URL)
-        response.raise_for_status()  # Levanta um erro se a requisição falhar
+        response.raise_for_status()
         with open(DB_PATH, "wb") as f:
             f.write(response.content)
         st.success("Banco de dados baixado com sucesso!")
     except requests.exceptions.RequestException as e:
         st.error(f"Erro ao baixar o banco de dados do GitHub. Verifique a URL: {GITHUB_DB_URL}")
         st.error(f"Detalhes do erro: {e}")
-        st.stop()  # Interrompe a execução em caso de falha grave
+        st.stop()
 
 @st.cache_resource
 def init_db():
@@ -92,7 +84,6 @@ def init_db():
     ''')
     conn.commit()
 
-    # Verifica se a tabela 'products' está vazia e preenche se necessário
     cur.execute('SELECT COUNT(*) FROM products')
     if cur.fetchone()[0] == 0:
         st.warning("Banco de dados 'products' está vazio. Preenchendo com dados de exemplo...")
@@ -151,32 +142,65 @@ def get_nutri_consumption(conn):
     df = pd.read_sql_query(query, conn)
     return df
 
+def clamp(value, min_val, max_val):
+    return max(min_val, min(value, max_val))
+
 def compute_health_score(sodium, sugar, fat, is_gmo):
-    score = 100
-    if sodium > 400: score -= 20
-    elif sodium > 200: score -= 10
+    # Score de 0 a 10
+    score = 10.0
 
-    if sugar > 20: score -= 20
-    elif sugar > 10: score -= 10
+    if sodium > 600:
+        score -= 4.0
+    elif sodium > 200:
+        score -= 2.0
     
-    if fat > 10: score -= 20
-    elif fat > 5: score -= 10
+    if sugar > 15:
+        score -= 4.0
+    elif sugar > 5:
+        score -= 2.0
+        
+    if fat > 20:
+        score -= 2.0
+    elif fat > 5:
+        score -= 1.0
     
-    if is_gmo == "Sim": score -= 15
+    if is_gmo == "Sim":
+        score -= 1.0
 
-    return max(0, score)
+    return round(clamp(score, 0.0, 10.0), 1)
 
 def score_label(score):
-    if score >= 80: return "Bom"
-    if score >= 50: return "Médio"
-    return "Ruim"
+    if score >= 8.0:
+        return "Excelente"
+    elif score >= 6.0:
+        return "Bom"
+    elif score >= 4.0:
+        return "Médio"
+    else:
+        return "Ruim"
+
+# --- CLASSE PARA O SCANNER EM TEMPO REAL ---
+
+class BarcodeScanner(VideoTransformerBase):
+    def transform(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        barcodes = decode(gray)
+        
+        if barcodes:
+            barcode_data = barcodes[0].data.decode("utf-8")
+            (x, y, w, h) = barcodes[0].rect
+            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.putText(img, barcode_data, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            st.session_state.last_scanned_barcode = barcode_data
+            
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # --- APLICAÇÃO STREAMLIT PRINCIPAL ---
 
 st.set_page_config(page_title='Scanner Saudável', layout='wide')
 st.title('Scanner Saudável 🥦📱')
 
-# Inicializa o banco de dados (e baixa se não existir)
 conn = init_db()
 
 if 'user_id' not in st.session_state:
@@ -187,7 +211,6 @@ if 'username' not in st.session_state:
 def login_user():
     st.session_state.user_id = get_user_id(conn, st.session_state.username)
 
-# --- Autenticação do Usuário ---
 if st.session_state.user_id is None:
     username = st.text_input("Digite seu nome de usuário para começar:")
     if st.button("Entrar"):
@@ -199,35 +222,23 @@ if st.session_state.user_id is None:
             st.warning("Por favor, digite um nome de usuário.")
     st.stop()
 
-# --- Menu Principal ---
 st.sidebar.header(f"Bem-vindo, {st.session_state.username}!")
 menu = st.sidebar.radio("Navegação", ["Consulta", "Cadastrar Novo Produto", "Meu Histórico", "Painel do Nutricionista"])
 
-# --- Página de Consulta ---
 if menu == "Consulta":
     st.header("🔍 Consulta de Produtos")
+    st.info("Aponte a câmera para um código de barras para escanear.")
+    webrtc_streamer(key="barcode-scanner", video_processor_factory=BarcodeScanner, rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
     
-    barcode_input = st.text_input("Digite o código de barras:")
-    uploaded_image = st.file_uploader("Ou faça upload de uma foto do código de barras:", type=["jpg", "jpeg", "png"])
-    
-    barcode = barcode_input.strip()
-    
-    if uploaded_image and PYZBAR_AVAILABLE:
-        image = Image.open(uploaded_image)
-        barcodes = decode(image)
-        if barcodes:
-            barcode = barcodes[0].data.decode('utf-8')
-            st.info(f"Código de barras detectado: {barcode}")
-        else:
-            st.error("Nenhum código de barras detectado na imagem.")
-
-    if barcode:
+    if 'last_scanned_barcode' in st.session_state and st.session_state.last_scanned_barcode:
+        barcode = st.session_state.last_scanned_barcode
+        st.subheader(f"Código de Barras Encontrado: {barcode}")
         product_data = get_product_by_barcode(conn, barcode)
+        
         if product_data:
             st.subheader(f"✅ Produto Encontrado: {product_data['name']}")
             st.write(f"**Marca:** {product_data['brand']}")
             
-            # Cálculo e exibição do score
             score = compute_health_score(
                 product_data['sodium_mg_per_100g'],
                 product_data['sugar_g_per_100g'],
@@ -236,14 +247,11 @@ if menu == "Consulta":
             )
             label = score_label(score)
             
-            if label == "Bom":
-                st.success(f"Qualidade Nutricional: **{label}**")
-            elif label == "Médio":
-                st.warning(f"Qualidade Nutricional: **{label}**")
-            else:
-                st.error(f"Qualidade Nutricional: **{label}**")
+            st.markdown("---")
+            st.subheader("Avaliação Geral")
+            st.progress(score / 10.0)
+            st.markdown(f"### Qualidade Nutricional: **{label}** ({score:.1f}/10)")
             
-            # Tabela de detalhes
             details = {
                 "Sódio": f"{product_data['sodium_mg_per_100g']} mg/100g",
                 "Açúcar": f"{product_data['sugar_g_per_100g']} g/100g",
@@ -255,17 +263,15 @@ if menu == "Consulta":
             if st.button("Validar Consumo"):
                 add_consumption(conn, st.session_state.user_id, barcode)
                 st.success(f"Consumo de '{product_data['name']}' registrado com sucesso!")
-
+                del st.session_state.last_scanned_barcode
         else:
             st.warning("Produto não encontrado no banco de dados. Gostaria de adicioná-lo?")
             if st.button("Cadastrar Novo Produto"):
                 st.session_state.menu = "Cadastrar Novo Produto"
                 st.experimental_rerun()
-
-# --- Página de Cadastrar Novo Produto ---
+    
 elif menu == "Cadastrar Novo Produto":
     st.header("📝 Cadastrar Novo Produto")
-    
     with st.form("new_product_form"):
         new_barcode = st.text_input("Código de Barras", placeholder="Ex: 7891234567890")
         new_name = st.text_input("Nome do Produto")
@@ -275,18 +281,13 @@ elif menu == "Cadastrar Novo Produto":
         new_sugar = st.number_input("Açúcar (g por 100g)", min_value=0.0)
         new_fat = st.number_input("Gordura Total (g por 100g)", min_value=0.0)
         new_gmo = st.selectbox("Contém Transgênico?", ["Não", "Sim"])
-        
         submitted = st.form_submit_button("Cadastrar")
         if submitted:
             if new_barcode and new_name and new_brand:
                 new_product = {
-                    'barcode': new_barcode,
-                    'name': new_name,
-                    'brand': new_brand,
-                    'category': new_category,
-                    'sodium_mg_per_100g': new_sodium,
-                    'sugar_g_per_100g': new_sugar,
-                    'total_fat_g_per_100g': new_fat,
+                    'barcode': new_barcode, 'name': new_name, 'brand': new_brand,
+                    'category': new_category, 'sodium_mg_per_100g': new_sodium,
+                    'sugar_g_per_100g': new_sugar, 'total_fat_g_per_100g': new_fat,
                     'is_gmo': new_gmo
                 }
                 add_product(conn, new_product)
@@ -295,83 +296,60 @@ elif menu == "Cadastrar Novo Produto":
             else:
                 st.error("Por favor, preencha todos os campos obrigatórios.")
 
-# --- Página Meu Histórico ---
 elif menu == "Meu Histórico":
     st.header("⏳ Meu Histórico de Consumo")
     consumption_df = get_user_consumption(conn, st.session_state.user_id)
-    
     if consumption_df.empty:
         st.info("Você ainda não validou nenhum consumo. Use a página 'Consulta' para começar!")
     else:
         st.subheader("Itens Consumidos")
         st.dataframe(consumption_df[['timestamp', 'name', 'brand', 'sodium_mg_per_100g', 'sugar_g_per_100g', 'total_fat_g_per_100g', 'is_gmo']].set_index('timestamp'))
-
         st.subheader("Visão Geral do Seu Consumo")
         st.bar_chart(consumption_df['category'].value_counts())
-        
-        # Gráfico de pizza com avaliação de saúde
         consumption_df['score'] = consumption_df.apply(
             lambda row: compute_health_score(row['sodium_mg_per_100g'], row['sugar_g_per_100g'], row['total_fat_g_per_100g'], row['is_gmo']), axis=1
         )
         consumption_df['label'] = consumption_df['score'].apply(score_label)
-        
         st.subheader("Qualidade Nutricional do Seu Consumo")
         label_counts = consumption_df['label'].value_counts().reset_index()
         label_counts.columns = ['label', 'count']
-        
         pie_chart = alt.Chart(label_counts).mark_arc(outerRadius=120).encode(
             theta=alt.Theta("count", stack=True),
-            color=alt.Color("label", sort=["Bom", "Médio", "Ruim"], scale=alt.Scale(domain=["Bom", "Médio", "Ruim"], range=["#34a853", "#fbbc05", "#ea4335"])),
+            color=alt.Color("label", sort=["Excelente", "Bom", "Médio", "Ruim"], scale=alt.Scale(domain=["Excelente", "Bom", "Médio", "Ruim"], range=["#34a853", "#fbbc05", "#4285f4", "#ea4335"])),
             order=alt.Order("count", sort="descending"),
             tooltip=["label", "count"]
-        ).properties(
-            title="Distribuição da Qualidade dos Itens Consumidos"
-        )
-        
+        ).properties(title="Distribuição da Qualidade dos Itens Consumidos")
         st.altair_chart(pie_chart, use_container_width=True)
 
-# --- Página Painel do Nutricionista ---
 elif menu == "Painel do Nutricionista":
     st.header("👨‍⚕️ Painel do Nutricionista")
     password = st.text_input("Digite a senha para acesso:", type="password")
-    
     if password == NUTRI_PASSWORD:
         st.success("Acesso concedido!")
-        
         nutri_df = get_nutri_consumption(conn)
         if nutri_df.empty:
             st.info("Ainda não há dados de consumo registrados pelos usuários.")
         else:
             st.subheader("Histórico de Consumo Geral dos Usuários")
             st.dataframe(nutri_df.set_index('timestamp'))
-            
             st.subheader("Análise por Usuário")
             users = nutri_df['username'].unique()
             selected_user = st.selectbox("Selecione um usuário:", users)
-            
             user_specific_df = nutri_df[nutri_df['username'] == selected_user]
-            
             st.subheader(f"Consumo de {selected_user}")
             st.bar_chart(user_specific_df['category'].value_counts())
-            
             user_specific_df['score'] = user_specific_df.apply(
                 lambda row: compute_health_score(row['sodium_mg_per_100g'], row['sugar_g_per_100g'], row['total_fat_g_per_100g'], row['is_gmo']), axis=1
             )
             user_specific_df['label'] = user_specific_df['score'].apply(score_label)
-            
             label_counts_user = user_specific_df['label'].value_counts().reset_index()
             label_counts_user.columns = ['label', 'count']
-            
             pie_chart_user = alt.Chart(label_counts_user).mark_arc(outerRadius=120).encode(
                 theta=alt.Theta("count", stack=True),
-                color=alt.Color("label", sort=["Bom", "Médio", "Ruim"], scale=alt.Scale(domain=["Bom", "Médio", "Ruim"], range=["#34a853", "#fbbc05", "#ea4335"])),
+                color=alt.Color("label", sort=["Excelente", "Bom", "Médio", "Ruim"], scale=alt.Scale(domain=["Excelente", "Bom", "Médio", "Ruim"], range=["#34a853", "#fbbc05", "#4285f4", "#ea4335"])),
                 order=alt.Order("count", sort="descending"),
                 tooltip=["label", "count"]
-            ).properties(
-                title=f"Qualidade Nutricional do Consumo de {selected_user}"
-            )
-            
+            ).properties(title=f"Qualidade Nutricional do Consumo de {selected_user}")
             st.altair_chart(pie_chart_user, use_container_width=True)
-            
     elif password:
         st.error("Senha incorreta.")
