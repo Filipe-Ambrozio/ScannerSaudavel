@@ -3,3 +3,5 @@ pandas
 pyzbar
 Pillow
 requests
+streamlit-webrtc
+opencv-python
